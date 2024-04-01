@@ -1,25 +1,25 @@
-from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
-from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from fleecekmbackend.core.config import DATABASE_URL
+from sqlalchemy.ext.declarative import declarative_base
 
-engine = create_async_engine(DATABASE_URL)
-async_session = sessionmaker(engine, class_=AsyncSession)
+engine = create_engine(DATABASE_URL)
+session = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
-async def get_db():
-    async with async_session() as db:
+def get_db():
+    db = session()
+    try:
         yield db
+    finally:
+        db.close()
 
-async def create_tables():
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
+def create_tables():
+    Base.metadata.create_all(bind=engine)
 
-async def create_tables_if_not_exist():
-    async with engine.begin() as conn:
-        await create_tables()
+def create_tables_if_not_exist():
+    create_tables()
 
-async def delete_tables():
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.drop_all)
+def delete_tables():
+    Base.metadata.drop_all(bind=engine)
 

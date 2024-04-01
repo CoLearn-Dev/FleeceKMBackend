@@ -1,16 +1,14 @@
 import re
 import time
 import logging
-import asyncio
-
+import sqlite3
 from datetime import datetime
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import Session
 from typing import List, Tuple
-
-from fleecekmbackend.db.ctl import async_session
 from fleecekmbackend.db.models import Paragraph, Author, Question, Answer, Rating
 from fleecekmbackend.db.helpers import create_author_if_not_exists
 from fleecekmbackend.core.utils.llm import llm_safe_request, randwait, generate_prompts_from_template
+from fleecekmbackend.core.config import DATABASE_URL
 
 WAIT = 0.5
 MODEL = "mistralai/Mixtral-8x7B-Instruct-v0.1"
@@ -21,28 +19,28 @@ NUMQUESTIONS = 3
 MAX_ATTEMPTS = 5
 
 ############################ Main Functions ############################
-async def process_paragraph(db: AsyncSession, paragraph: Paragraph) -> Tuple[List[Question], List[Answer], List[Rating]]:
+def process_paragraph(db: sqlite3.Connection, paragraph: Paragraph) -> Tuple[List[Question], List[Answer], List[Rating]]:
     generated_questions = []
     generated_answers = []
     generated_ratings = []
     try:
         print(f"Processing paragraph: {paragraph.id}")
 
-        questions = await generate_questions(db, paragraph)
+        questions = generate_questions(db, paragraph)
 
         print(f"generated_questions: {questions}")
 
         generated_questions.extend(questions)
         for question in questions:
             try:
-                async with db.begin_nested():
+                with db:
                     # Generate answers
                     for setting in ["zs", "ic"]:
-                        answer = await generate_answer(db, question, setting)
+                        answer = generate_answer(db, question, setting)
                         generated_answers.append(answer)
 
                         # Generate answer ratings
-                        rating = await generate_answer_rating(db, question, answer)
+                        rating = generate_answer_rating(db, question, answer)
                         generated_ratings.append(rating)
 
             except Exception as e:
@@ -50,32 +48,32 @@ async def process_paragraph(db: AsyncSession, paragraph: Paragraph) -> Tuple[Lis
                 logging.error(str(e))
                 raise
     except Exception as e:
-        await db.rollback()
+        db.rollback()
         raise
     return generated_questions, generated_answers, generated_ratings
 
-async def process_paragraphs(db: AsyncSession, paragraphs: List[Paragraph]) -> Tuple[List[Question], List[Answer], List[Rating]]:
+def process_paragraphs(db: sqlite3.Connection, paragraphs: List[Paragraph]) -> Tuple[List[Question], List[Answer], List[Rating]]:
     generated_questions = []
     generated_answers = []
     generated_ratings = []
     try:
         for paragraph in paragraphs:
             try:
-                async with db.begin():
+                with db:
                     # Generate questions
-                    questions = await generate_questions(db, paragraph)
+                    questions = generate_questions(db, paragraph)
                     generated_questions.extend(questions)
 
                     for question in questions:
                         try:
-                            async with db.begin_nested():
+                            with db:
                                 # Generate answers
                                 for setting in ["zs", "ic"]:
-                                    answer = await generate_answer(db, question, setting)
+                                    answer = generate_answer(db, question, setting)
                                     generated_answers.append(answer)
 
                                     # Generate answer ratings
-                                    rating = await generate_answer_rating(db, question, answer)
+                                    rating = generate_answer_rating(db, question, answer)
                                     generated_ratings.append(rating)
 
                         except Exception as e:
@@ -89,15 +87,15 @@ async def process_paragraphs(db: AsyncSession, paragraphs: List[Paragraph]) -> T
                 raise
 
     except Exception as e:
-        await db.rollback()
+        db.rollback()
         raise
 
     return generated_questions, generated_answers, generated_ratings
 
 ############################ Generation Functions ############################
 # Generate questions for a paragraph
-async def generate_questions(
-    db: AsyncSession,
+def generate_questions(
+    db: sqlite3.Connection,
     paragraph: Paragraph,
     k: int = NUMQUESTIONS,
     max_attempts: int = MAX_ATTEMPTS,
@@ -117,7 +115,7 @@ async def generate_questions(
         },
     )
 
-    author = await create_author_if_not_exists(template, MODEL)
+    author = create_author_if_not_exists(template, MODEL)
     
     print(f"Generating questions for paragraph: {paragraph.id}")
 
@@ -183,13 +181,16 @@ async def generate_questions(
             downvote=0,
         )
         print(f"Adding question: {question.text}")
-        async with async_session() as session:
-            session.add(question)
-            await session.commit()
+        cursor = db.cursor()
+        cursor.execute(
+            "INSERT INTO question (paragraph_id, scope, context, text, author_id, timestamp, upvote, downvote) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (question.paragraph_id, question.scope, question.context, question.text, question.author_id, question.timestamp, question.upvote, question.downvote)
+        )
+        db.commit()
     return good_questions
 
-async def generate_answer(
-    db: AsyncSession,
+def generate_answer(
+    db: sqlite3.Connection,
     question: Question,
     context: str = None,
     max_attempts: int = MAX_ATTEMPTS,
@@ -198,7 +199,7 @@ async def generate_answer(
     time.sleep(randwait(WAIT))
     prompt_template = "{PROMPT_PREFIX}{CONTEXT_PROMPT}Answer the following question in a succinct manner: {QUESTION}\n{PROMPT_SUFFIX}"
 
-    paragraph = await db.get(Paragraph, question.paragraph_id)
+    paragraph = db.query(Paragraph).get(question.paragraph_id)
     _, fact = generate_fact_with_context(paragraph)
 
     if context:
@@ -217,7 +218,7 @@ async def generate_answer(
             "PROMPT_SUFFIX": PROMPT_SUFFIX,
         },
     )
-    author = await create_author_if_not_exists(template, MODEL)
+    author = create_author_if_not_exists(template, MODEL)
 
     # main loop
     attempts = 0
@@ -236,15 +237,15 @@ async def generate_answer(
                 text=answer_text,
             )
             db.add(answer)
-            await db.commit()
+            db.commit()
             return answer
 
     raise Exception(
         f"Cannot generate a valid answer after {max_attempts} attempts. \n Question: {question.text}"
     )
 
-async def generate_answer_rating(
-    db: AsyncSession,
+def generate_answer_rating(
+    db: sqlite3.Connection,
     question: Question,
     answer: Answer,
     max_attempts: int = MAX_ATTEMPTS,
@@ -253,7 +254,7 @@ async def generate_answer_rating(
     time.sleep(randwait(WAIT))
     prompt_template = "{PROMPT_PREFIX}Based on this fact: \n\n `{REFERENCE}` \n\n Rate the following answer to the question - Question: `{QUESTION}` \n\n Answer: `{ANSWER}`; give a number from 0-5 where 0 is 'No answer or completely irrelevant', 1 is 'Significantly incorrect or incomplete', 2 is 'Partially correct; major inaccuracies or omissions', 3 is 'Correct but lacks depth; minimal detail', 4 is 'Mostly correct; minor errors, includes relevant details', 5 is 'Fully accurate and detailed; clear and comprehensive'. Your answer should follow the form `Answer:<number> \n Rationale:<justify your judgment in a paragraph>`. \n{PROMPT_SUFFIX}"
 
-    paragraph = await db.get(Paragraph, question.paragraph_id)
+    paragraph = db.query(Paragraph).get(question.paragraph_id)
     _, reference = generate_fact_with_context(paragraph)
 
     prompt, template = generate_prompts_from_template(
@@ -267,7 +268,7 @@ async def generate_answer_rating(
         },
     )
 
-    author = await create_author_if_not_exists(template, MODEL)
+    author = create_author_if_not_exists(template, MODEL)
 
     # main loop
     attempts = 0
@@ -289,7 +290,7 @@ async def generate_answer_rating(
                 timestamp=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             )
             db.add(rating)
-            await db.commit()
+            db.commit()
 
             return rating
 
